@@ -42,11 +42,15 @@ type task[Req any, Resp any] struct {
 type Options struct {
 	// WorkersLimitMax is a maximum workers count, default 0 (unlimited)
 	WorkersLimitMax int
+
 	// WorkersLimitMin is a minimum workers count, default 0 (unlimited)
 	WorkersLimitMin int
+
 	// StopWorkerTimeout is a timeout for worker to stop, default 5 seconds
 	StopWorkerTimeout time.Duration
-	// GroupResponseChannelSize is a size of group response channel, default 32
+
+	// GroupResponseChannelSize is the size of group response channel, default 32.
+	// Sized channel is used to receive responses from workers while waiting group.Wait call.
 	GroupResponseChannelSize int
 }
 
@@ -71,6 +75,7 @@ func New[Req any, Resp any](handler func(Req) Resp, opts *Options) *Pool[Req, Re
 		}
 		if opts.WorkersLimitMin > 0 {
 			wp.workersLimitMin = int64(opts.WorkersLimitMin)
+			atomic.AddInt64(&wp.workersCount, int64(opts.WorkersLimitMin))
 			for i := 0; i < opts.WorkersLimitMin; i++ {
 				go wp.newWorker(nil)
 			}
@@ -80,7 +85,10 @@ func New[Req any, Resp any](handler func(Req) Resp, opts *Options) *Pool[Req, Re
 	return wp
 }
 
-// AcquireGroup acquires new group
+// AcquireGroup acquires the new group.
+// Use `group.Wait` to wait for all tasks in group to be done.
+// You should call ReleaseGroup after `group.Wait` is done.
+// You must not use the group after calling ReleaseGroup.
 func (w *Pool[Req, Resp]) AcquireGroup() *Group[Req, Resp] {
 	g := w.groupsPool.Get()
 	if g == nil {
@@ -95,8 +103,9 @@ func (w *Pool[Req, Resp]) AcquireGroup() *Group[Req, Resp] {
 }
 
 // ReleaseGroup releases group
+// You must not use group after calling ReleaseGroup.
 func (w *Pool[Req, Resp]) ReleaseGroup(g *Group[Req, Resp]) {
-	// if group is busy, let GC collect it later
+	// if the group is busy, let GC collect it later
 	if atomic.LoadInt64(&g.counter) == 0 {
 		w.groupsPool.Put(g)
 	}
@@ -107,7 +116,7 @@ func (w *Pool[Req, Resp]) WorkersCount() int64 {
 	return atomic.LoadInt64(&w.workersCount)
 }
 
-// Wait waits for all tasks in group to be done
+// Wait waits for all tasks in group to be done or context is done.
 func (g *Group[Req, Resp]) Wait(ctx context.Context, dest []Resp) []Resp {
 	for {
 		select {
@@ -122,7 +131,7 @@ func (g *Group[Req, Resp]) Wait(ctx context.Context, dest []Resp) []Resp {
 	}
 }
 
-// Go runs task in group (unblocking)
+// Go runs the task in the group (unblocking)
 func (g *Group[Req, Resp]) Go(req Req) {
 	atomic.AddInt64(&g.counter, 1)
 	t := g.acquireTaskFunc()
@@ -135,22 +144,22 @@ func (w *Pool[Req, Resp]) task(t *task[Req, Resp]) {
 	select {
 	case w.tasks <- t:
 	default:
-		// if workers limit is not set, then create new worker
-		if w.workersLimitMax <= 0 {
+		count := atomic.AddInt64(&w.workersCount, 1)
+
+		// if the worker max limit is not set, or we did not exceed it, then create a new worker
+		if w.workersLimitMax <= 0 || count <= w.workersLimitMax {
 			go w.newWorker(t)
 			return
 		}
-		if atomic.LoadInt64(&w.workersCount) < w.workersLimitMax {
-			go w.newWorker(t)
-			return
-		}
-		w.newWorker(t)
+
+		// if the worker max limit is set, and we exceeded it, then wait for free worker
+		atomic.AddInt64(&w.workersCount, -1)
+		w.tasks <- t
 		return
 	}
 }
 
 func (w *Pool[Req, Resp]) newWorker(t *task[Req, Resp]) {
-	atomic.AddInt64(&w.workersCount, 1)
 	defer atomic.AddInt64(&w.workersCount, -1)
 
 	if t != nil {

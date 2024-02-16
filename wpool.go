@@ -118,6 +118,9 @@ func (w *Pool[Req, Resp]) WorkersCount() int64 {
 
 // Wait waits for all tasks in group to be done or context is done.
 func (g *Group[Req, Resp]) Wait(ctx context.Context, dest []Resp) []Resp {
+	if atomic.LoadInt64(&g.counter) == 0 {
+		return dest
+	}
 	for {
 		select {
 		case <-ctx.Done():
